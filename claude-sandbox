@@ -282,21 +282,30 @@ list_mcp_servers() {
     configs=$(find_mcp_configs "$repo_path")
 
     [[ -z "$configs" ]] && return
+    command -v python3 &>/dev/null || return
 
+    local config_list=""
     while IFS= read -r config; do
-        if command -v python3 &>/dev/null; then
-            python3 -c "
-import json, sys
-with open('$config') as f:
-    data = json.load(f)
-for name in sorted(data.get('mcpServers', {})):
-    server = data['mcpServers'][name]
-    cmd = server.get('command', '?')
-    args = ' '.join(server.get('args', [])[:2])
-    print(f'{name}\t{cmd} {args}\t$config')
-" 2>/dev/null
-        fi
+        [[ -z "$config" ]] && continue
+        config_list="${config_list}${config_list:+,}\"${config}\""
     done <<< "$configs"
+
+    python3 -c "
+import json
+configs = [${config_list}]
+seen = {}
+for config_path in configs:
+    with open(config_path) as f:
+        data = json.load(f)
+    for name, server in data.get('mcpServers', {}).items():
+        if name not in seen:
+            cmd = server.get('command', '?')
+            args = ' '.join(server.get('args', [])[:2])
+            seen[name] = (cmd, args, config_path)
+for name in sorted(seen):
+    cmd, args, src = seen[name]
+    print(f'{name}\t{cmd} {args}\t{src}')
+" 2>/dev/null
 }
 
 pick_mcp_servers() {
@@ -664,12 +673,12 @@ cmd_run() {
         --name "$container_name" \
         --hostname "claude-sandbox" \
         -v "$repo_path:/home/claude/repo" \
-        "${docker_args[@]}" \
+        ${docker_args[@]+"${docker_args[@]}"} \
         --memory="$memory" \
         --cpus="$cpus" \
         --network="$network" \
         "$image" \
-        "${claude_args[@]}"
+        ${claude_args[@]+"${claude_args[@]}"}
 }
 
 # ─── Shell ────────────────────────────────────────────────────────────────────
@@ -721,7 +730,7 @@ cmd_shell() {
         --hostname "claude-sandbox" \
         --entrypoint /bin/bash \
         -v "$repo_path:/home/claude/repo" \
-        "${docker_args[@]}" \
+        ${docker_args[@]+"${docker_args[@]}"} \
         --memory="$memory" \
         --cpus="$cpus" \
         --network="$network" \
