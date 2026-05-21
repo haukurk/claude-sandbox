@@ -90,6 +90,7 @@ claude-sandbox stop all
 | `--no-config` | | Don't mount `~/.claude` |
 | `--no-mcp` | | Skip MCP server selection |
 | `--no-agents` | | Skip agent selection |
+| `--no-scan` | | Skip secrets scan |
 | `--build` | | Rebuild image first |
 | `--name` | | Custom container name |
 
@@ -104,6 +105,29 @@ claude-sandbox stop all
 | Other repos | Nope |
 | Network | Up to you (`host` / `none` / `bridge`) |
 | RAM / CPU | Capped |
+
+## Secrets scanner
+
+Before mounting a repo, `claude-sandbox` scans for sensitive files and hardcoded secrets. If anything is found, you get a warning and a chance to abort:
+
+```
+  ⚠  Sensitive data detected in this repo
+
+  Claude will have full read-write access to these files inside the sandbox.
+  It could read, modify, or accidentally expose secrets in prompts.
+
+  file  .env
+  file  config/credentials.json
+  key   src/config.ts  ANTHROPIC_API_KEY=sk-ant-...
+
+  ▸ Continue anyway? [y/N]
+```
+
+It checks for:
+- **Sensitive files** — `.env`, `*.pem`, `*.key`, private keys, credential files, `secrets.yml`, etc.
+- **Hardcoded secrets** — API keys (Anthropic, OpenAI, AWS, GitHub, GitLab, Slack), private key blocks, passwords/tokens in config, database connection strings
+
+Skip with `--no-scan` if you know what you're doing.
 
 ## MCP servers & agents
 

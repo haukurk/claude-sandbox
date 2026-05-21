@@ -52,6 +52,150 @@ check_docker() {
     fi
 }
 
+# ─── Secrets Scanner ─────────────────────────────────────────────────────────
+
+SENSITIVE_FILES=(
+    ".env"
+    ".env.local"
+    ".env.production"
+    ".env.staging"
+    ".env.development"
+    "*.pem"
+    "*.key"
+    "*.p12"
+    "*.pfx"
+    "*.jks"
+    "id_rsa"
+    "id_ed25519"
+    "id_ecdsa"
+    "id_dsa"
+    ".npmrc"
+    ".pypirc"
+    ".netrc"
+    ".docker/config.json"
+    "credentials.json"
+    "service-account*.json"
+    "gcloud-service-key.json"
+    "secrets.yml"
+    "secrets.yaml"
+    "vault.yml"
+    "vault.yaml"
+    ".htpasswd"
+    "*.keystore"
+    "token.json"
+)
+
+SECRET_PATTERNS=(
+    'ANTHROPIC_API_KEY\s*='
+    'OPENAI_API_KEY\s*='
+    'sk-ant-[a-zA-Z0-9]'
+    'sk-[a-zA-Z0-9]{20,}'
+    'AKIA[0-9A-Z]{16}'
+    'aws_secret_access_key\s*='
+    'ghp_[a-zA-Z0-9]{36}'
+    'gho_[a-zA-Z0-9]{36}'
+    'github_pat_[a-zA-Z0-9]'
+    'glpat-[a-zA-Z0-9]'
+    'xoxb-[0-9]'
+    'xoxp-[0-9]'
+    'xapp-[0-9]'
+    'PRIVATE KEY-----'
+    'password\s*[:=]\s*["\x27][^\s]'
+    'secret\s*[:=]\s*["\x27][^\s]'
+    'token\s*[:=]\s*["\x27][^\s]'
+    'database_url\s*=\s*postgres'
+    'mongodb(\+srv)?://[^/\s]+:[^/\s]+@'
+    'redis://[^/\s]*:[^/\s]+@'
+)
+
+scan_secrets() {
+    local repo_path="$1"
+    local findings=()
+
+    # Check for sensitive files
+    for pattern in "${SENSITIVE_FILES[@]}"; do
+        while IFS= read -r match; do
+            [[ -z "$match" ]] && continue
+            # Skip if in .git directory
+            [[ "$match" == *"/.git/"* ]] && continue
+            # Skip if in node_modules
+            [[ "$match" == *"/node_modules/"* ]] && continue
+            local relative="${match#$repo_path/}"
+            findings+=("${YELLOW}file${RESET}  $relative")
+        done < <(find "$repo_path" -maxdepth 4 -name "$pattern" -type f 2>/dev/null)
+    done
+
+    # Check for secret patterns in tracked files
+    if command -v git &>/dev/null && [[ -d "$repo_path/.git" ]]; then
+        local tracked_files
+        tracked_files=$(git -C "$repo_path" ls-files 2>/dev/null)
+
+        if [[ -n "$tracked_files" ]]; then
+            for pat in "${SECRET_PATTERNS[@]}"; do
+                while IFS=: read -r file line_content; do
+                    [[ -z "$file" ]] && continue
+                    [[ "$file" == *".lock"* ]] && continue
+                    [[ "$file" == *"node_modules"* ]] && continue
+                    [[ "$file" == *".min.js"* ]] && continue
+                    # Truncate long matches
+                    local preview="${line_content:0:60}"
+                    [[ ${#line_content} -gt 60 ]] && preview="${preview}..."
+                    preview=$(echo "$preview" | sed 's/[[:space:]]*$//')
+                    findings+=("${RED}key${RESET}   $file  ${DIM}${preview}${RESET}")
+                done < <(cd "$repo_path" && echo "$tracked_files" | xargs grep -IHn -E "$pat" 2>/dev/null | head -5)
+            done
+        fi
+    fi
+
+    if [[ ${#findings[@]} -eq 0 ]]; then
+        return 1
+    fi
+
+    # Deduplicate
+    local seen=()
+    local unique=()
+    for f in "${findings[@]}"; do
+        local key="${f%%  *}"
+        local found=false
+        for s in "${seen[@]:-}"; do
+            [[ "$s" == "$f" ]] && found=true && break
+        done
+        if [[ "$found" == false ]]; then
+            seen+=("$f")
+            unique+=("$f")
+        fi
+    done
+
+    echo ""
+    echo -e "${YELLOW}${BOLD}  ⚠  Sensitive data detected in this repo${RESET}"
+    echo ""
+    echo -e "  Claude will have ${BOLD}full read-write access${RESET} to these files inside the sandbox."
+    echo -e "  It could read, modify, or accidentally expose secrets in prompts."
+    echo ""
+
+    local count=0
+    for f in "${unique[@]}"; do
+        echo -e "  $f"
+        ((count++))
+        if [[ $count -ge 20 ]]; then
+            local remaining=$(( ${#unique[@]} - 20 ))
+            if [[ $remaining -gt 0 ]]; then
+                dim "  ... and $remaining more"
+            fi
+            break
+        fi
+    done
+
+    echo ""
+    echo -ne "  ${GREEN}▸${RESET} Continue anyway? [y/N] "
+    local answer
+    read -r answer
+    if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+        log "Aborted."
+        exit 0
+    fi
+}
+
 # ─── Repo Picker ──────────────────────────────────────────────────────────────
 
 find_repos() {
@@ -296,70 +440,67 @@ pick_agents() {
 # ─── Help ─────────────────────────────────────────────────────────────────────
 
 usage() {
-    cat <<EOF
-${BOLD}claude-sandbox${RESET} v${VERSION}
-Run Claude Code off-leash in isolated Docker containers.
-
-${BOLD}USAGE${RESET}
-    claude-sandbox <command> [options]
-
-${BOLD}COMMANDS${RESET}
-    ${BOLD}run${RESET} [path] [opts] [-- claude args]    Launch Claude on a repo (interactive if no path)
-    ${BOLD}login${RESET}                                  Authenticate with Claude (no API key needed)
-    ${BOLD}build${RESET} [--no-cache] [version]           Build/rebuild the Docker image
-    ${BOLD}list${RESET}                                   List running containers
-    ${BOLD}stop${RESET} <name|all>                        Stop a container (or all)
-    ${BOLD}shell${RESET} [path]                           Open a bash shell in a container (no Claude)
-    ${BOLD}version${RESET}                                Print version
-    ${BOLD}help${RESET}                                   Show this help
-
-${BOLD}EXAMPLES${RESET}
-    claude-sandbox                                      Interactive — pick repo, MCP servers, agents
-    claude-sandbox run ~/my-project
-    claude-sandbox run ~/my-project -- -p "fix the bug"
-    claude-sandbox run --no-mcp --no-agents ~/my-project
-    claude-sandbox shell ~/my-project
-    claude-sandbox build --no-cache 1.0.2
-    claude-sandbox stop all
-
-${BOLD}ENVIRONMENT${RESET}
-    ANTHROPIC_API_KEY              API key (or use 'claude-sandbox login')
-    CLAUDE_CODE_USE_BEDROCK        Set to 1 for AWS Bedrock
-    CLAUDE_CODE_USE_VERTEX         Set to 1 for Google Vertex
-    CLAUDE_SANDBOX_REPO_DIRS       Colon-separated repo search paths
-
-Run ${BOLD}claude-sandbox help <command>${RESET} for command-specific help.
-EOF
+    echo -e "${BOLD}claude-sandbox${RESET} v${VERSION}"
+    echo -e "Run Claude Code off-leash in isolated Docker containers."
+    echo ""
+    echo -e "${BOLD}USAGE${RESET}"
+    echo -e "    claude-sandbox <command> [options]"
+    echo ""
+    echo -e "${BOLD}COMMANDS${RESET}"
+    echo -e "    ${BOLD}run${RESET} [path] [opts] [-- claude args]    Launch Claude on a repo (interactive if no path)"
+    echo -e "    ${BOLD}login${RESET}                                  Authenticate with Claude (no API key needed)"
+    echo -e "    ${BOLD}build${RESET} [--no-cache] [version]           Build/rebuild the Docker image"
+    echo -e "    ${BOLD}list${RESET}                                   List running containers"
+    echo -e "    ${BOLD}stop${RESET} <name|all>                        Stop a container (or all)"
+    echo -e "    ${BOLD}shell${RESET} [path]                           Open a bash shell in a container (no Claude)"
+    echo -e "    ${BOLD}version${RESET}                                Print version"
+    echo -e "    ${BOLD}help${RESET}                                   Show this help"
+    echo ""
+    echo -e "${BOLD}EXAMPLES${RESET}"
+    echo -e "    claude-sandbox                                      Interactive — pick repo, MCP servers, agents"
+    echo -e "    claude-sandbox run ~/my-project"
+    echo -e "    claude-sandbox run ~/my-project -- -p \"fix the bug\""
+    echo -e "    claude-sandbox run --no-mcp --no-agents ~/my-project"
+    echo -e "    claude-sandbox shell ~/my-project"
+    echo -e "    claude-sandbox build --no-cache 1.0.2"
+    echo -e "    claude-sandbox stop all"
+    echo ""
+    echo -e "${BOLD}ENVIRONMENT${RESET}"
+    echo -e "    ANTHROPIC_API_KEY              API key (or use 'claude-sandbox login')"
+    echo -e "    CLAUDE_CODE_USE_BEDROCK        Set to 1 for AWS Bedrock"
+    echo -e "    CLAUDE_CODE_USE_VERTEX         Set to 1 for Google Vertex"
+    echo -e "    CLAUDE_SANDBOX_REPO_DIRS       Colon-separated repo search paths"
+    echo ""
+    echo -e "Run ${BOLD}claude-sandbox help <command>${RESET} for command-specific help."
 }
 
 usage_run() {
-    cat <<EOF
-${BOLD}claude-sandbox run${RESET} — Launch Claude on a repo
-
-${BOLD}USAGE${RESET}
-    claude-sandbox run [options] [repo-path] [-- claude-args...]
-
-    If no repo path is given, an interactive picker is shown.
-
-${BOLD}OPTIONS${RESET}
-    -m, --memory <limit>    Memory limit (default: ${DEFAULT_MEMORY})
-    -c, --cpus <count>      CPU limit (default: ${DEFAULT_CPUS})
-    -n, --network <mode>    Network mode: host, none, bridge (default: ${DEFAULT_NETWORK})
-    -i, --image <name>      Docker image (default: ${IMAGE})
-        --no-config         Don't mount ~/.claude
-        --no-mcp            Skip MCP server selection
-        --no-agents         Skip agent selection
-        --build             Rebuild image before launching
-        --name <name>       Custom container name
-
-${BOLD}EXAMPLES${RESET}
-    claude-sandbox run
-    claude-sandbox run ~/repos/my-app
-    claude-sandbox run -m 8g -c 4 ~/repos/my-app
-    claude-sandbox run --network none ~/repos/untrusted-code
-    claude-sandbox run --no-mcp --no-agents ~/repos/my-app
-    claude-sandbox run ~/repos/my-app -- -p "add unit tests for auth"
-EOF
+    echo -e "${BOLD}claude-sandbox run${RESET} — Launch Claude on a repo"
+    echo ""
+    echo -e "${BOLD}USAGE${RESET}"
+    echo -e "    claude-sandbox run [options] [repo-path] [-- claude-args...]"
+    echo ""
+    echo -e "    If no repo path is given, an interactive picker is shown."
+    echo ""
+    echo -e "${BOLD}OPTIONS${RESET}"
+    echo -e "    -m, --memory <limit>    Memory limit (default: ${DEFAULT_MEMORY})"
+    echo -e "    -c, --cpus <count>      CPU limit (default: ${DEFAULT_CPUS})"
+    echo -e "    -n, --network <mode>    Network mode: host, none, bridge (default: ${DEFAULT_NETWORK})"
+    echo -e "    -i, --image <name>      Docker image (default: ${IMAGE})"
+    echo -e "        --no-config         Don't mount ~/.claude"
+    echo -e "        --no-mcp            Skip MCP server selection"
+    echo -e "        --no-agents         Skip agent selection"
+    echo -e "        --no-scan           Skip secrets scan"
+    echo -e "        --build             Rebuild image before launching"
+    echo -e "        --name <name>       Custom container name"
+    echo ""
+    echo -e "${BOLD}EXAMPLES${RESET}"
+    echo -e "    claude-sandbox run"
+    echo -e "    claude-sandbox run ~/repos/my-app"
+    echo -e "    claude-sandbox run -m 8g -c 4 ~/repos/my-app"
+    echo -e "    claude-sandbox run --network none ~/repos/untrusted-code"
+    echo -e "    claude-sandbox run --no-mcp --no-agents ~/repos/my-app"
+    echo -e "    claude-sandbox run ~/repos/my-app -- -p \"add unit tests for auth\""
 }
 
 # ─── Build ────────────────────────────────────────────────────────────────────
@@ -398,6 +539,7 @@ cmd_run() {
     local repo_path=""
     local skip_mcp=false
     local skip_agents=false
+    local skip_scan=false
     local claude_args=()
     local docker_args=()
 
@@ -411,6 +553,7 @@ cmd_run() {
             --no-config) mount_config=false; shift ;;
             --no-mcp) skip_mcp=true; shift ;;
             --no-agents) skip_agents=true; shift ;;
+            --no-scan) skip_scan=true; shift ;;
             --build) build=true; shift ;;
             --name) custom_name="$2"; shift 2 ;;
             --) shift; claude_args=("$@"); break ;;
@@ -435,6 +578,11 @@ cmd_run() {
     fi
 
     repo_path="$(cd "$repo_path" && pwd)"
+
+    # Scan for secrets
+    if [[ "$skip_scan" == false ]]; then
+        scan_secrets "$repo_path" || true
+    fi
 
     local container_name="${custom_name:-claude-$(basename "$repo_path" | tr './' '-' | tr '[:upper:]' '[:lower:]')}"
 
