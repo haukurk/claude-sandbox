@@ -595,6 +595,11 @@ cmd_run() {
 
     local container_name="${custom_name:-claude-$(basename "$repo_path" | tr './' '-' | tr '[:upper:]' '[:lower:]')}"
 
+    # Remove stale container with the same name
+    if docker container inspect "$container_name" &>/dev/null; then
+        docker rm -f "$container_name" &>/dev/null
+    fi
+
     # Build if needed
     if [[ "$build" == true ]] || ! docker image inspect "$image" &>/dev/null; then
         cmd_build
@@ -721,6 +726,10 @@ cmd_shell() {
 
     repo_path="$(cd "$repo_path" && pwd)"
     local container_name="claude-shell-$(basename "$repo_path" | tr './' '-' | tr '[:upper:]' '[:lower:]')"
+
+    if docker container inspect "$container_name" &>/dev/null; then
+        docker rm -f "$container_name" &>/dev/null
+    fi
 
     if ! docker image inspect "$IMAGE" &>/dev/null; then
         cmd_build
