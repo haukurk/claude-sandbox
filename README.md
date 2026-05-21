@@ -2,9 +2,9 @@
 
 Run Claude Code off-leash — inside a container, so your filesystem stays out of reach.
 
-`--dangerously-skip-permissions` lets Claude *frussukóða* your code — no prompts, no guardrails, pure autonomy. The problem is it can frussukóða your entire machine just as easily. SSH keys, `.env` files, other repos, that folder of unsorted screenshots from 2019 — all fair game.
+`--dangerously-skip-permissions` lets Claude *frussukóða* your code — no prompts, no guardrails, pure autonomy. The problem is that without isolation, it has access to your entire machine.
 
-This puts Claude in a fenced yard. Pick a repo, it gets mounted into a Docker container, and that's all Claude can see. It can `rm -rf /` all day and the only casualty is a disposable container.
+This puts Claude in a fenced yard. Pick a repo, it gets mounted into a Docker container, and that's all Claude can see. Your SSH keys, `.env` files, other repos, and the rest of your filesystem are completely unreachable. Claude can `rm -rf /` all day and the only casualty is a disposable container.
 
 ## Install
 
