@@ -237,27 +237,28 @@ pick_repo() {
 
     # Fallback: numbered menu
     echo "" >&2
-    echo -e "${BOLD}Pick a repo to mount in the sandbox:${RESET}" >&2
-    dim "Only this folder will be accessible. Your filesystem, home directory," >&2
-    dim "and all other repos stay completely out of reach." >&2
-    echo "" >&2
+    echo -e "  ${BOLD}Select Repo${RESET}  ${DIM}Only this folder will be mounted in the sandbox${RESET}" >&2
+    echo -e "  ${DIM}───────────────────────────────────────────────────${RESET}" >&2
 
     local i=1
     for repo in "${repos[@]}"; do
-        printf "  ${BOLD}%3d${RESET}  %s\n" "$i" "${repo/#$HOME/~}" >&2
+        local display="${repo/#$HOME/~}"
+        local dir_name="${display##*/}"
+        local parent="${display%/*}/"
+        printf "  ${BOLD}%3d${RESET}  ${CYAN}%-25s${RESET}  ${DIM}%s${RESET}\n" "$i" "$dir_name" "$parent" >&2
         ((i++))
     done
     echo "" >&2
 
     local choice
     while true; do
-        echo -ne "  ${GREEN}▸${RESET} Enter number (1-${#repos[@]}): " >&2
+        echo -ne "  ${GREEN}▸${RESET} " >&2
         read -r choice
         if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#repos[@]} )); then
             echo "${repos[$((choice-1))]}"
             return
         fi
-        warn "Invalid choice. Try again."
+        warn "  Invalid choice. Try again."
     done
 }
 
@@ -310,7 +311,6 @@ for name in sorted(seen):
 
 pick_mcp_servers() {
     local repo_path="${1:-}"
-    local servers=()
     local names=()
     local details=()
 
@@ -318,43 +318,54 @@ pick_mcp_servers() {
         [[ -z "$name" ]] && continue
         names+=("$name")
         details+=("$detail")
-        servers+=("$name")
     done < <(list_mcp_servers "$repo_path")
 
-    if [[ ${#servers[@]} -eq 0 ]]; then
-        return
-    fi
+    [[ ${#names[@]} -eq 0 ]] && return
+
+    # All selected by default
+    local selected=()
+    for i in "${!names[@]}"; do selected+=(1); done
 
     echo "" >&2
-    echo -e "${BOLD}MCP servers found in your config:${RESET}" >&2
-    dim "Select which ones to make available in the sandbox." >&2
-    echo "" >&2
+    echo -e "  ${BOLD}MCP Servers${RESET}  ${DIM}Toggle: number · a=all · n=none · enter=confirm${RESET}" >&2
+    echo -e "  ${DIM}───────────────────────────────────────────────────${RESET}" >&2
 
-    local i=1
-    for idx in "${!names[@]}"; do
-        printf "  ${BOLD}%3d${RESET}  ${CYAN}%-20s${RESET}  ${DIM}%s${RESET}\n" "$i" "${names[$idx]}" "${details[$idx]}" >&2
-        ((i++))
-    done
-    echo "" >&2
-    echo -e "  ${DIM}Enter numbers separated by spaces, 'all', or 'none'${RESET}" >&2
+    render_mcp() {
+        for idx in "${!names[@]}"; do
+            local check="${RED}○${RESET}"
+            [[ "${selected[$idx]}" -eq 1 ]] && check="${GREEN}●${RESET}"
+            printf "  ${check}  ${BOLD}%-20s${RESET}  ${DIM}%s${RESET}\n" "${names[$idx]}" "${details[$idx]}" >&2
+        done
+    }
 
-    local choice
-    echo -ne "  ${GREEN}▸${RESET} MCP servers: " >&2
-    read -r choice
+    render_mcp
 
-    if [[ "$choice" == "none" || -z "$choice" ]]; then
-        return
-    fi
+    while true; do
+        echo -ne "\n  ${GREEN}▸${RESET} " >&2
+        read -r choice
+        [[ -z "$choice" ]] && break
 
-    if [[ "$choice" == "all" ]]; then
-        printf '%s\n' "${names[@]}"
-        return
-    fi
-
-    for num in $choice; do
-        if [[ "$num" =~ ^[0-9]+$ ]] && (( num >= 1 && num <= ${#names[@]} )); then
-            echo "${names[$((num-1))]}"
+        if [[ "$choice" == "a" ]]; then
+            for i in "${!selected[@]}"; do selected[$i]=1; done
+        elif [[ "$choice" == "n" ]]; then
+            for i in "${!selected[@]}"; do selected[$i]=0; done
+        else
+            for num in $choice; do
+                if [[ "$num" =~ ^[0-9]+$ ]] && (( num >= 1 && num <= ${#names[@]} )); then
+                    local i=$((num-1))
+                    selected[$i]=$(( 1 - selected[$i] ))
+                fi
+            done
         fi
+
+        # Redraw
+        printf "\033[%dA" $(( ${#names[@]} + 1 )) >&2
+        printf "\033[J" >&2
+        render_mcp
+    done
+
+    for idx in "${!names[@]}"; do
+        [[ "${selected[$idx]}" -eq 1 ]] && echo "${names[$idx]}"
     done
 }
 
@@ -400,49 +411,66 @@ find_agents() {
 pick_agents() {
     local agents=()
     local names=()
+    local descriptions=()
 
     while IFS= read -r path; do
         [[ -z "$path" ]] && continue
-        local name
-        name="$(basename "$path" .md)"
         agents+=("$path")
-        names+=("$name")
+        names+=("$(basename "$path" .md)")
+        # Extract first non-empty, non-frontmatter line as description
+        local desc
+        desc=$(sed -n '/^---$/,/^---$/d; /^#/d; /^$/d; s/^[[:space:]]*//; p; q' "$path" 2>/dev/null)
+        descriptions+=("${desc:0:50}")
     done < <(find_agents)
 
-    if [[ ${#agents[@]} -eq 0 ]]; then
-        return
-    fi
+    [[ ${#agents[@]} -eq 0 ]] && return
+
+    local selected=()
+    for i in "${!agents[@]}"; do selected+=(1); done
 
     echo "" >&2
-    echo -e "${BOLD}Custom agents found:${RESET}" >&2
-    dim "Select which ones to include in the sandbox." >&2
-    echo "" >&2
+    echo -e "  ${BOLD}Agents${RESET}  ${DIM}Toggle: number · a=all · n=none · enter=confirm${RESET}" >&2
+    echo -e "  ${DIM}───────────────────────────────────────────────────${RESET}" >&2
 
-    local i=1
-    for name in "${names[@]}"; do
-        printf "  ${BOLD}%3d${RESET}  %s\n" "$i" "$name" >&2
-        ((i++))
-    done
-    echo "" >&2
-    echo -e "  ${DIM}Enter numbers separated by spaces, 'all', or 'none'${RESET}" >&2
+    render_agents() {
+        for idx in "${!names[@]}"; do
+            local check="${RED}○${RESET}"
+            [[ "${selected[$idx]}" -eq 1 ]] && check="${GREEN}●${RESET}"
+            if [[ -n "${descriptions[$idx]}" ]]; then
+                printf "  ${check}  ${BOLD}%-20s${RESET}  ${DIM}%s${RESET}\n" "${names[$idx]}" "${descriptions[$idx]}" >&2
+            else
+                printf "  ${check}  ${BOLD}%s${RESET}\n" "${names[$idx]}" >&2
+            fi
+        done
+    }
 
-    local choice
-    echo -ne "  ${GREEN}▸${RESET} Agents: " >&2
-    read -r choice
+    render_agents
 
-    if [[ "$choice" == "none" || -z "$choice" ]]; then
-        return
-    fi
+    while true; do
+        echo -ne "\n  ${GREEN}▸${RESET} " >&2
+        read -r choice
+        [[ -z "$choice" ]] && break
 
-    if [[ "$choice" == "all" ]]; then
-        printf '%s\n' "${agents[@]}"
-        return
-    fi
-
-    for num in $choice; do
-        if [[ "$num" =~ ^[0-9]+$ ]] && (( num >= 1 && num <= ${#agents[@]} )); then
-            echo "${agents[$((num-1))]}"
+        if [[ "$choice" == "a" ]]; then
+            for i in "${!selected[@]}"; do selected[$i]=1; done
+        elif [[ "$choice" == "n" ]]; then
+            for i in "${!selected[@]}"; do selected[$i]=0; done
+        else
+            for num in $choice; do
+                if [[ "$num" =~ ^[0-9]+$ ]] && (( num >= 1 && num <= ${#agents[@]} )); then
+                    local i=$((num-1))
+                    selected[$i]=$(( 1 - selected[$i] ))
+                fi
+            done
         fi
+
+        printf "\033[%dA" $(( ${#names[@]} + 1 )) >&2
+        printf "\033[J" >&2
+        render_agents
+    done
+
+    for idx in "${!agents[@]}"; do
+        [[ "${selected[$idx]}" -eq 1 ]] && echo "${agents[$idx]}"
     done
 }
 
