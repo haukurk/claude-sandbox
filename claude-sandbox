@@ -309,64 +309,103 @@ for name in sorted(seen):
 " 2>/dev/null
 }
 
-pick_mcp_servers() {
-    local repo_path="${1:-}"
+# ─── Interactive Toggle Picker ────────────────────────────────────────────────
+# Usage: toggle_picker "Title" "name1|detail1" "name2|detail2" ...
+# Outputs selected names to stdout. All selected by default.
+# Controls: up/down arrows, space=toggle, a=all, n=none, enter=confirm
+
+toggle_picker() {
+    local title="$1"; shift
+    local items=("$@")
+    local count=${#items[@]}
+    local cursor=0
+    local selected=()
     local names=()
     local details=()
 
-    while IFS=$'\t' read -r name detail source; do
-        [[ -z "$name" ]] && continue
-        names+=("$name")
-        details+=("$detail")
-    done < <(list_mcp_servers "$repo_path")
+    for item in "${items[@]}"; do
+        names+=("${item%%|*}")
+        details+=("${item#*|}")
+        selected+=(1)
+    done
 
-    [[ ${#names[@]} -eq 0 ]] && return
+    # Hide cursor
+    printf "\033[?25l" >&2
 
-    # All selected by default
-    local selected=()
-    for i in "${!names[@]}"; do selected+=(1); done
+    # Restore cursor on exit
+    trap 'printf "\033[?25h" >&2' RETURN
 
     echo "" >&2
-    echo -e "  ${BOLD}MCP Servers${RESET}  ${DIM}Toggle: number · a=all · n=none · enter=confirm${RESET}" >&2
-    echo -e "  ${DIM}───────────────────────────────────────────────────${RESET}" >&2
+    echo -e "  ${BOLD}${title}${RESET}  ${DIM}↑↓ move · space toggle · a all · n none · enter confirm${RESET}" >&2
+    echo -e "  ${DIM}───────────────────────────────────────────────────────────${RESET}" >&2
 
-    render_mcp() {
+    render_list() {
         for idx in "${!names[@]}"; do
             local check="${RED}○${RESET}"
             [[ "${selected[$idx]}" -eq 1 ]] && check="${GREEN}●${RESET}"
-            printf "  ${check}  ${BOLD}%-20s${RESET}  ${DIM}%s${RESET}\n" "${names[$idx]}" "${details[$idx]}" >&2
+            local pointer="  "
+            [[ $idx -eq $cursor ]] && pointer="${GREEN}▸${RESET} "
+            if [[ -n "${details[$idx]}" && "${details[$idx]}" != "${names[$idx]}" ]]; then
+                printf "  ${pointer}${check}  ${BOLD}%-20s${RESET}  ${DIM}%s${RESET}\n" "${names[$idx]}" "${details[$idx]}" >&2
+            else
+                printf "  ${pointer}${check}  ${BOLD}%s${RESET}\n" "${names[$idx]}" >&2
+            fi
         done
     }
 
-    render_mcp
+    render_list
 
     while true; do
-        echo -ne "\n  ${GREEN}▸${RESET} " >&2
-        read -r choice
-        [[ -z "$choice" ]] && break
+        # Read single keypress
+        IFS= read -rsn1 key <&2 2>/dev/null || IFS= read -rsn1 key </dev/tty
 
-        if [[ "$choice" == "a" ]]; then
+        if [[ "$key" == "" ]]; then
+            # Enter pressed
+            break
+        elif [[ "$key" == " " ]]; then
+            # Space — toggle current
+            selected[$cursor]=$(( 1 - selected[$cursor] ))
+        elif [[ "$key" == "a" ]]; then
             for i in "${!selected[@]}"; do selected[$i]=1; done
-        elif [[ "$choice" == "n" ]]; then
+        elif [[ "$key" == "n" ]]; then
             for i in "${!selected[@]}"; do selected[$i]=0; done
-        else
-            for num in $choice; do
-                if [[ "$num" =~ ^[0-9]+$ ]] && (( num >= 1 && num <= ${#names[@]} )); then
-                    local i=$((num-1))
-                    selected[$i]=$(( 1 - selected[$i] ))
-                fi
-            done
+        elif [[ "$key" == $'\x1b' ]]; then
+            # Escape sequence — read next two chars
+            IFS= read -rsn2 seq <&2 2>/dev/null || IFS= read -rsn2 seq </dev/tty
+            case "$seq" in
+                '[A') # Up
+                    (( cursor > 0 )) && (( cursor-- ))
+                    ;;
+                '[B') # Down
+                    (( cursor < count - 1 )) && (( cursor++ ))
+                    ;;
+            esac
         fi
 
         # Redraw
-        printf "\033[%dA" $(( ${#names[@]} + 1 )) >&2
-        printf "\033[J" >&2
-        render_mcp
+        printf "\033[%dA\033[J" "$count" >&2
+        render_list
     done
+
+    echo "" >&2
 
     for idx in "${!names[@]}"; do
         [[ "${selected[$idx]}" -eq 1 ]] && echo "${names[$idx]}"
     done
+}
+
+pick_mcp_servers() {
+    local repo_path="${1:-}"
+    local items=()
+
+    while IFS=$'\t' read -r name detail source; do
+        [[ -z "$name" ]] && continue
+        items+=("${name}|${detail}")
+    done < <(list_mcp_servers "$repo_path")
+
+    [[ ${#items[@]} -eq 0 ]] && return
+
+    toggle_picker "MCP Servers" "${items[@]}"
 }
 
 build_mcp_config() {
@@ -410,67 +449,34 @@ find_agents() {
 
 pick_agents() {
     local agents=()
-    local names=()
-    local descriptions=()
+    local items=()
 
     while IFS= read -r path; do
         [[ -z "$path" ]] && continue
+        local name
+        name="$(basename "$path" .md)"
         agents+=("$path")
-        names+=("$(basename "$path" .md)")
-        # Extract first non-empty, non-frontmatter line as description
         local desc
         desc=$(sed -n '/^---$/,/^---$/d; /^#/d; /^$/d; s/^[[:space:]]*//; p; q' "$path" 2>/dev/null)
-        descriptions+=("${desc:0:50}")
+        items+=("${name}|${desc:0:50}")
     done < <(find_agents)
 
-    [[ ${#agents[@]} -eq 0 ]] && return
+    [[ ${#items[@]} -eq 0 ]] && return
 
-    local selected=()
-    for i in "${!agents[@]}"; do selected+=(1); done
+    local selected_names=()
+    while IFS= read -r name; do
+        [[ -z "$name" ]] && continue
+        selected_names+=("$name")
+    done < <(toggle_picker "Agents" "${items[@]}")
 
-    echo "" >&2
-    echo -e "  ${BOLD}Agents${RESET}  ${DIM}Toggle: number · a=all · n=none · enter=confirm${RESET}" >&2
-    echo -e "  ${DIM}───────────────────────────────────────────────────${RESET}" >&2
-
-    render_agents() {
-        for idx in "${!names[@]}"; do
-            local check="${RED}○${RESET}"
-            [[ "${selected[$idx]}" -eq 1 ]] && check="${GREEN}●${RESET}"
-            if [[ -n "${descriptions[$idx]}" ]]; then
-                printf "  ${check}  ${BOLD}%-20s${RESET}  ${DIM}%s${RESET}\n" "${names[$idx]}" "${descriptions[$idx]}" >&2
-            else
-                printf "  ${check}  ${BOLD}%s${RESET}\n" "${names[$idx]}" >&2
+    # Map selected names back to file paths
+    for name in "${selected_names[@]}"; do
+        for idx in "${!agents[@]}"; do
+            if [[ "$(basename "${agents[$idx]}" .md)" == "$name" ]]; then
+                echo "${agents[$idx]}"
+                break
             fi
         done
-    }
-
-    render_agents
-
-    while true; do
-        echo -ne "\n  ${GREEN}▸${RESET} " >&2
-        read -r choice
-        [[ -z "$choice" ]] && break
-
-        if [[ "$choice" == "a" ]]; then
-            for i in "${!selected[@]}"; do selected[$i]=1; done
-        elif [[ "$choice" == "n" ]]; then
-            for i in "${!selected[@]}"; do selected[$i]=0; done
-        else
-            for num in $choice; do
-                if [[ "$num" =~ ^[0-9]+$ ]] && (( num >= 1 && num <= ${#agents[@]} )); then
-                    local i=$((num-1))
-                    selected[$i]=$(( 1 - selected[$i] ))
-                fi
-            done
-        fi
-
-        printf "\033[%dA" $(( ${#names[@]} + 1 )) >&2
-        printf "\033[J" >&2
-        render_agents
-    done
-
-    for idx in "${!agents[@]}"; do
-        [[ "${selected[$idx]}" -eq 1 ]] && echo "${agents[$idx]}"
     done
 }
 
