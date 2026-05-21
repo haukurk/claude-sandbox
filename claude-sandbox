@@ -712,7 +712,7 @@ cmd_run() {
             local tmp_creds
             tmp_creds=$(mktemp)
             echo "$creds_json" > "$tmp_creds"
-            docker_args+=(-v "${tmp_creds}:/home/claude/.claude-host/.credentials.json:ro")
+            docker_args+=(-v "${tmp_creds}:/home/claude/.credentials-host.json:ro")
             trap "rm -f '$tmp_creds' ${tmp_mcp:-}" EXIT
         fi
     fi
