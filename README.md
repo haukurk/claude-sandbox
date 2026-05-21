@@ -174,7 +174,7 @@ claude-sandbox login
 export ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-`claude-sandbox login` runs `claude login` inside the container and saves your session to `~/.claude`. After that, every container picks it up automatically — no key needed.
+`claude-sandbox login` authenticates via your browser and saves the session to `~/.claude`. If you have `claude` installed on your host (recommended), it uses that directly for native keychain support. Otherwise it falls back to a container-based login. Either way, every sandbox container picks up the session automatically — no key needed.
 
 AWS Bedrock and Google Vertex are also supported via env vars — see `.env.example`.
 

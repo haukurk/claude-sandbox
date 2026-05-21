@@ -740,26 +740,42 @@ cmd_shell() {
 # ─── Login ────────────────────────────────────────────────────────────────────
 
 cmd_login() {
+    mkdir -p "${HOME}/.claude"
+
+    # Prefer host-based login — it uses the native keychain and avoids
+    # UID mismatch issues with Docker volume mounts.
+    if command -v claude &>/dev/null; then
+        log "Logging in via host Claude CLI..."
+        dim "Your session is saved to ~/.claude and shared with all sandbox containers."
+        echo ""
+        claude login
+        return
+    fi
+
+    # Fallback: run login inside the container with matching UID
     check_docker
 
     if ! docker image inspect "$IMAGE" &>/dev/null; then
         cmd_build
     fi
 
-    mkdir -p "${HOME}/.claude"
+    local host_uid
+    host_uid=$(id -u)
 
-    log "Launching Claude login..."
-    dim "This will open a browser to authenticate. Your session is saved to ~/.claude."
+    log "Logging in via container (claude not found on host)..."
+    dim "Your session is saved to ~/.claude and shared with all sandbox containers."
     echo ""
 
     docker run -it --rm \
         --name "claude-sandbox-login" \
         --hostname "claude-sandbox" \
-        --entrypoint claude \
-        -v "${HOME}/.claude:/home/claude/.claude" \
+        --entrypoint /bin/bash \
+        -u "$host_uid" \
+        -v "${HOME}/.claude:/tmp/.claude-auth" \
+        -e HOME=/tmp/claude-home \
         --network=host \
         "$IMAGE" \
-        login
+        -c 'mkdir -p /tmp/claude-home/.claude && claude login && cp -a /tmp/claude-home/.claude/* /tmp/.claude-auth/ 2>/dev/null; echo "Auth files synced."'
 }
 
 # ─── List ─────────────────────────────────────────────────────────────────────
