@@ -692,6 +692,31 @@ cmd_run() {
         log "Agents:      ${BOLD}${agent_names[*]}${RESET}"
     fi
 
+    # Extract OAuth credentials from macOS Keychain for the container.
+    # Claude Code stores auth in the system Keychain which containers can't access,
+    # so we pull the token out and write a .credentials.json the container can read.
+    if [[ "$mount_config" == true ]]; then
+        local creds_json=""
+        if command -v security &>/dev/null; then
+            local keychain_blob
+            keychain_blob=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null) || true
+            if [[ -n "$keychain_blob" ]]; then
+                creds_json="$keychain_blob"
+            fi
+        fi
+        # Fallback: check for file-based credentials
+        if [[ -z "$creds_json" && -f "${HOME}/.claude/.credentials.json" ]]; then
+            creds_json=$(cat "${HOME}/.claude/.credentials.json" 2>/dev/null)
+        fi
+        if [[ -n "$creds_json" ]]; then
+            local tmp_creds
+            tmp_creds=$(mktemp)
+            echo "$creds_json" > "$tmp_creds"
+            docker_args+=(-v "${tmp_creds}:/home/claude/.claude-host/.credentials.json:ro")
+            trap "rm -f '$tmp_creds' ${tmp_mcp:-}" EXIT
+        fi
+    fi
+
     # Pass through env vars
     local env_vars=(
         ANTHROPIC_API_KEY

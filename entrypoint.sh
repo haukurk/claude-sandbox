@@ -15,6 +15,11 @@ if [[ -f /home/claude/.mcp-host.json ]]; then
     cp /home/claude/.mcp-host.json /home/claude/.mcp.json 2>/dev/null || true
 fi
 
+# Ensure credentials extracted from macOS Keychain are in place
+if [[ -f /home/claude/.claude/.credentials.json ]]; then
+    chmod 600 /home/claude/.claude/.credentials.json 2>/dev/null || true
+fi
+
 # Always set status line to the bundled container path — host paths don't exist here.
 if [[ -f /home/claude/.claude/settings.json ]]; then
     tmp=$(mktemp)
