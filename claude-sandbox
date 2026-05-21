@@ -1,0 +1,402 @@
+#!/usr/bin/env bash
+#
+# claude-sandbox — Run Claude Code in isolated Docker containers.
+#
+set -euo pipefail
+
+VERSION="0.1.0"
+IMAGE="claude-sandbox:latest"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Defaults
+DEFAULT_MEMORY="4g"
+DEFAULT_CPUS="2"
+DEFAULT_NETWORK="host"
+
+# Repo search paths (override with CLAUDE_SANDBOX_REPO_DIRS)
+DEFAULT_REPO_DIRS="${HOME}/Repos:${HOME}/repos:${HOME}/projects:${HOME}/src:${HOME}/code:${HOME}/dev:${HOME}/work"
+REPO_DIRS="${CLAUDE_SANDBOX_REPO_DIRS:-$DEFAULT_REPO_DIRS}"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+BOLD='\033[1m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+log()   { echo -e "${GREEN}▸${RESET} $*"; }
+warn()  { echo -e "${YELLOW}▸${RESET} $*" >&2; }
+error() { echo -e "${RED}✖${RESET} $*" >&2; }
+dim()   { echo -e "${DIM}$*${RESET}"; }
+
+# ─── Repo Picker ──────────────────────────────────────────────────────────────
+
+find_repos() {
+    local dirs
+    IFS=':' read -ra dirs <<< "$REPO_DIRS"
+
+    for base in "${dirs[@]}"; do
+        [[ -d "$base" ]] || continue
+        find "$base" -maxdepth 3 -name ".git" -type d 2>/dev/null | while read -r gitdir; do
+            dirname "$gitdir"
+        done
+    done | sort -u
+}
+
+pick_repo() {
+    local repos=()
+    while IFS= read -r line; do
+        repos+=("$line")
+    done < <(find_repos)
+
+    if [[ ${#repos[@]} -eq 0 ]]; then
+        error "No git repos found in search paths."
+        dim "Searched: ${REPO_DIRS//:/, }"
+        dim "Set CLAUDE_SANDBOX_REPO_DIRS to customize, or pass a path directly."
+        exit 1
+    fi
+
+    # Use fzf if available
+    if command -v fzf &>/dev/null; then
+        local picked
+        picked=$(printf '%s\n' "${repos[@]}" | sed "s|${HOME}|~|g" | \
+            fzf --height=20 --reverse --prompt="Pick a repo > " \
+                --header="Only this repo will be mounted. Nothing else is accessible." \
+                --preview="ls -la {}" 2>/dev/null) || { error "No repo selected."; exit 1; }
+        picked="${picked/#\~/$HOME}"
+        echo "$picked"
+        return
+    fi
+
+    # Fallback: numbered menu
+    echo "" >&2
+    echo -e "${BOLD}Pick a repo to mount in the sandbox:${RESET}" >&2
+    dim "Only this folder will be accessible. Your filesystem, home directory," >&2
+    dim "and all other repos stay completely out of reach." >&2
+    echo "" >&2
+
+    local i=1
+    local display_paths=()
+    for repo in "${repos[@]}"; do
+        display_paths+=("${repo/#$HOME/~}")
+        printf "  ${BOLD}%3d${RESET}  %s\n" "$i" "${repo/#$HOME/~}" >&2
+        ((i++))
+    done
+    echo "" >&2
+
+    local choice
+    while true; do
+        echo -ne "  ${GREEN}▸${RESET} Enter number (1-${#repos[@]}): " >&2
+        read -r choice
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#repos[@]} )); then
+            echo "${repos[$((choice-1))]}"
+            return
+        fi
+        warn "Invalid choice. Try again."
+    done
+}
+
+# ─── Help ──────────────────────────────────────────────────────────────────────
+
+usage() {
+    cat <<EOF
+${BOLD}claude-sandbox${RESET} v${VERSION}
+Run Claude Code in isolated Docker containers.
+
+${BOLD}USAGE${RESET}
+    claude-sandbox <command> [options]
+
+${BOLD}COMMANDS${RESET}
+    ${BOLD}run${RESET} <path> [opts] [-- claude args]    Launch Claude on a repo
+    ${BOLD}build${RESET} [--no-cache] [version]           Build/rebuild the Docker image
+    ${BOLD}list${RESET}                                   List running containers
+    ${BOLD}stop${RESET} <name|all>                        Stop a container (or all)
+    ${BOLD}shell${RESET} <path> [opts]                    Open a bash shell in a container (no Claude)
+    ${BOLD}version${RESET}                                Print version
+    ${BOLD}help${RESET}                                   Show this help
+
+${BOLD}EXAMPLES${RESET}
+    claude-sandbox run ~/my-project
+    claude-sandbox run ~/my-project -- -p "fix the bug in auth.ts"
+    claude-sandbox run ~/my-project --memory 8g --cpus 4
+    claude-sandbox run ~/my-project --network none
+    claude-sandbox shell ~/my-project
+    claude-sandbox build
+    claude-sandbox build --no-cache 1.0.2
+    claude-sandbox stop all
+
+${BOLD}ENVIRONMENT${RESET}
+    ANTHROPIC_API_KEY          API key (required unless using Bedrock/Vertex)
+    CLAUDE_CODE_USE_BEDROCK    Set to 1 for AWS Bedrock
+    CLAUDE_CODE_USE_VERTEX     Set to 1 for Google Vertex
+
+Run ${BOLD}claude-sandbox help <command>${RESET} for command-specific help.
+EOF
+}
+
+usage_run() {
+    cat <<EOF
+${BOLD}claude-sandbox run${RESET} — Launch Claude on a repo
+
+${BOLD}USAGE${RESET}
+    claude-sandbox run [options] <repo-path> [-- claude-args...]
+
+${BOLD}OPTIONS${RESET}
+    -m, --memory <limit>    Memory limit (default: ${DEFAULT_MEMORY})
+    -c, --cpus <count>      CPU limit (default: ${DEFAULT_CPUS})
+    -n, --network <mode>    Network mode: host, none, bridge (default: ${DEFAULT_NETWORK})
+    -i, --image <name>      Docker image (default: ${IMAGE})
+        --no-config         Don't mount ~/.claude
+        --build             Rebuild image before launching
+        --name <name>       Custom container name
+
+${BOLD}EXAMPLES${RESET}
+    claude-sandbox run ~/repos/my-app
+    claude-sandbox run -m 8g -c 4 ~/repos/my-app
+    claude-sandbox run --network none ~/repos/untrusted-code
+    claude-sandbox run ~/repos/my-app -- -p "add unit tests for auth"
+EOF
+}
+
+# ─── Build ─────────────────────────────────────────────────────────────────────
+
+cmd_build() {
+    local no_cache=""
+    local version="latest"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --no-cache) no_cache="--no-cache"; shift ;;
+            -*) error "Unknown option: $1"; exit 1 ;;
+            *) version="$1"; shift ;;
+        esac
+    done
+
+    log "Building ${BOLD}${IMAGE}${RESET} (claude-code@${version})..."
+    docker build $no_cache --build-arg "CLAUDE_CODE_VERSION=${version}" -t "$IMAGE" "$SCRIPT_DIR"
+    log "Image ready: ${BOLD}${IMAGE}${RESET}"
+}
+
+# ─── Run ───────────────────────────────────────────────────────────────────────
+
+cmd_run() {
+    local memory="$DEFAULT_MEMORY"
+    local cpus="$DEFAULT_CPUS"
+    local network="$DEFAULT_NETWORK"
+    local image="$IMAGE"
+    local mount_config=true
+    local build=false
+    local custom_name=""
+    local repo_path=""
+    local claude_args=()
+    local docker_args=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help) usage_run; exit 0 ;;
+            -m|--memory) memory="$2"; shift 2 ;;
+            -c|--cpus) cpus="$2"; shift 2 ;;
+            -n|--network) network="$2"; shift 2 ;;
+            -i|--image) image="$2"; shift 2 ;;
+            --no-config) mount_config=false; shift ;;
+            --build) build=true; shift ;;
+            --name) custom_name="$2"; shift 2 ;;
+            --) shift; claude_args=("$@"); break ;;
+            -*) error "Unknown option: $1"; exit 1 ;;
+            *)
+                if [[ -z "$repo_path" ]]; then
+                    repo_path="$1"; shift
+                else
+                    error "Unexpected argument: $1"; exit 1
+                fi
+                ;;
+        esac
+    done
+
+    if [[ -z "$repo_path" ]]; then
+        repo_path="$(pick_repo)"
+    fi
+
+    if [[ ! -d "$repo_path" ]]; then
+        error "Not a directory: $repo_path"
+        exit 1
+    fi
+
+    repo_path="$(cd "$repo_path" && pwd)"
+
+    local container_name="${custom_name:-claude-$(basename "$repo_path" | tr './' '-' | tr '[:upper:]' '[:lower:]')}"
+
+    # Build if needed
+    if [[ "$build" == true ]] || ! docker image inspect "$image" &>/dev/null; then
+        cmd_build
+    fi
+
+    # Mount claude config
+    if [[ "$mount_config" == true && -d "${HOME}/.claude" ]]; then
+        docker_args+=(-v "${HOME}/.claude:/home/claude/.claude:ro")
+    fi
+
+    # Pass through env vars
+    local env_vars=(
+        ANTHROPIC_API_KEY
+        CLAUDE_CODE_USE_BEDROCK
+        AWS_PROFILE
+        AWS_REGION
+        AWS_ACCESS_KEY_ID
+        AWS_SECRET_ACCESS_KEY
+        CLAUDE_CODE_USE_VERTEX
+        GOOGLE_APPLICATION_CREDENTIALS
+    )
+    for var in "${env_vars[@]}"; do
+        if [[ -n "${!var:-}" ]]; then
+            docker_args+=(-e "${var}=${!var}")
+        fi
+    done
+
+    echo ""
+    log "Repo:      ${BOLD}${repo_path}${RESET}"
+    log "Container: ${BOLD}${container_name}${RESET}"
+    dim "  Memory: ${memory} | CPUs: ${cpus} | Network: ${network}"
+    echo ""
+
+    docker run -it --rm \
+        --name "$container_name" \
+        --hostname "claude-sandbox" \
+        -v "$repo_path:/home/claude/repo" \
+        "${docker_args[@]}" \
+        --memory="$memory" \
+        --cpus="$cpus" \
+        --network="$network" \
+        "$image" \
+        "${claude_args[@]}"
+}
+
+# ─── Shell ─────────────────────────────────────────────────────────────────────
+
+cmd_shell() {
+    local memory="$DEFAULT_MEMORY"
+    local cpus="$DEFAULT_CPUS"
+    local network="$DEFAULT_NETWORK"
+    local repo_path=""
+    local docker_args=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -m|--memory) memory="$2"; shift 2 ;;
+            -c|--cpus) cpus="$2"; shift 2 ;;
+            -n|--network) network="$2"; shift 2 ;;
+            -*) error "Unknown option: $1"; exit 1 ;;
+            *)
+                if [[ -z "$repo_path" ]]; then
+                    repo_path="$1"; shift
+                else
+                    error "Unexpected argument: $1"; exit 1
+                fi
+                ;;
+        esac
+    done
+
+    if [[ -z "$repo_path" ]]; then
+        repo_path="$(pick_repo)"
+    fi
+
+    repo_path="$(cd "$repo_path" && pwd)"
+    local container_name="claude-shell-$(basename "$repo_path" | tr './' '-' | tr '[:upper:]' '[:lower:]')"
+
+    if ! docker image inspect "$IMAGE" &>/dev/null; then
+        cmd_build
+    fi
+
+    if [[ -d "${HOME}/.claude" ]]; then
+        docker_args+=(-v "${HOME}/.claude:/home/claude/.claude:ro")
+    fi
+
+    log "Opening shell in ${BOLD}${repo_path}${RESET}"
+
+    docker run -it --rm \
+        --name "$container_name" \
+        --hostname "claude-sandbox" \
+        --entrypoint /bin/bash \
+        -v "$repo_path:/home/claude/repo" \
+        "${docker_args[@]}" \
+        --memory="$memory" \
+        --cpus="$cpus" \
+        --network="$network" \
+        "$IMAGE"
+}
+
+# ─── List ──────────────────────────────────────────────────────────────────────
+
+cmd_list() {
+    local containers
+    containers=$(docker ps --filter "ancestor=${IMAGE}" --format "table {{.Names}}\t{{.Status}}\t{{.RunningFor}}" 2>/dev/null)
+
+    if [[ -z "$containers" || "$containers" == "NAMES"* && $(echo "$containers" | wc -l) -le 1 ]]; then
+        dim "No running claude-sandbox containers."
+        return
+    fi
+
+    echo -e "${BOLD}Running containers:${RESET}"
+    echo "$containers"
+}
+
+# ─── Stop ──────────────────────────────────────────────────────────────────────
+
+cmd_stop() {
+    local target="${1:-}"
+
+    if [[ -z "$target" ]]; then
+        error "Specify a container name or 'all'."; exit 1
+    fi
+
+    if [[ "$target" == "all" ]]; then
+        local ids
+        ids=$(docker ps -q --filter "ancestor=${IMAGE}" 2>/dev/null)
+        if [[ -z "$ids" ]]; then
+            dim "No running containers to stop."
+            return
+        fi
+        log "Stopping all claude-sandbox containers..."
+        echo "$ids" | xargs docker stop
+        log "Done."
+    else
+        log "Stopping ${BOLD}${target}${RESET}..."
+        docker stop "$target"
+        log "Done."
+    fi
+}
+
+# ─── Main ──────────────────────────────────────────────────────────────────────
+
+main() {
+    if [[ $# -eq 0 ]]; then
+        cmd_run
+        return
+    fi
+
+    local cmd="$1"; shift
+
+    case "$cmd" in
+        run)     cmd_run "$@" ;;
+        build)   cmd_build "$@" ;;
+        list|ls) cmd_list "$@" ;;
+        stop)    cmd_stop "$@" ;;
+        shell|sh) cmd_shell "$@" ;;
+        version|-v|--version) echo "claude-sandbox v${VERSION}" ;;
+        help|-h|--help)
+            if [[ $# -gt 0 ]]; then
+                case "$1" in
+                    run) usage_run ;;
+                    *) usage ;;
+                esac
+            else
+                usage
+            fi
+            ;;
+        *) error "Unknown command: $cmd"; echo ""; usage; exit 1 ;;
+    esac
+}
+
+main "$@"
