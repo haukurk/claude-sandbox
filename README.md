@@ -178,9 +178,15 @@ export ANTHROPIC_API_KEY=sk-ant-...
 
 AWS Bedrock and Google Vertex are also supported via env vars — see `.env.example`.
 
+## Status line
+
+Every sandbox container comes with [claude-status-line](https://github.com/haukurk/claude-status-line) pre-installed — shows model, token usage, rate limits, and git status right in the Claude Code UI. No setup needed.
+
+If your host `~/.claude/settings.json` already has a `statusLine` config, that takes precedence.
+
 ## What's in the box
 
-Debian slim, Node 22, git, ripgrep, fd, curl, jq, python3, build-essential, and Claude Code. Runs as a non-root user. Nothing fancy, nothing extra.
+Debian slim, Node 22, git, ripgrep, fd, curl, jq, python3, build-essential, Claude Code, and [claude-status-line](https://github.com/haukurk/claude-status-line). Runs as a non-root user. Nothing fancy, nothing extra.
 
 ## Updating
 

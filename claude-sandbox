@@ -600,13 +600,15 @@ cmd_run() {
         cmd_build
     fi
 
-    # Mount claude config
+    # Mount claude config to staging paths (read-only). The entrypoint
+    # copies these into writable locations so Claude can persist state
+    # (workspace trust, session data) inside the container.
     if [[ "$mount_config" == true ]]; then
         if [[ -d "${HOME}/.claude" ]]; then
-            docker_args+=(-v "${HOME}/.claude:/home/claude/.claude:ro")
+            docker_args+=(-v "${HOME}/.claude:/home/claude/.claude-host:ro")
         fi
         if [[ -f "${HOME}/.claude.json" ]]; then
-            docker_args+=(-v "${HOME}/.claude.json:/home/claude/.claude.json:ro")
+            docker_args+=(-v "${HOME}/.claude.json:/home/claude/.claude-host.json:ro")
         fi
     fi
 
@@ -626,7 +628,7 @@ cmd_run() {
             local tmp_mcp
             tmp_mcp=$(mktemp)
             echo "$mcp_json" > "$tmp_mcp"
-            docker_args+=(-v "${tmp_mcp}:/home/claude/.mcp.json:ro")
+            docker_args+=(-v "${tmp_mcp}:/home/claude/.mcp-host.json:ro")
             trap "rm -f '$tmp_mcp'" EXIT
             echo ""
             log "MCP servers: ${BOLD}${selected_mcp[*]}${RESET}"
@@ -643,7 +645,7 @@ cmd_run() {
     fi
 
     if [[ ${#selected_agents[@]} -gt 0 ]]; then
-        docker_args+=(-v "${HOME}/.claude/agents:/home/claude/.claude/agents:ro")
+        docker_args+=(-v "${HOME}/.claude/agents:/home/claude/.claude-host/agents:ro")
         local agent_names=()
         for a in "${selected_agents[@]}"; do
             agent_names+=("$(basename "$a" .md)")
@@ -725,10 +727,10 @@ cmd_shell() {
     fi
 
     if [[ -d "${HOME}/.claude" ]]; then
-        docker_args+=(-v "${HOME}/.claude:/home/claude/.claude:ro")
+        docker_args+=(-v "${HOME}/.claude:/home/claude/.claude-host:ro")
     fi
     if [[ -f "${HOME}/.claude.json" ]]; then
-        docker_args+=(-v "${HOME}/.claude.json:/home/claude/.claude.json:ro")
+        docker_args+=(-v "${HOME}/.claude.json:/home/claude/.claude-host.json:ro")
     fi
 
     log "Opening shell in ${BOLD}${repo_path}${RESET}"
