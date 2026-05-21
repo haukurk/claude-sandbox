@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# claude-sandbox — Run Claude Code in isolated Docker containers.
+# claude-sandbox — Run Claude Code off-leash in isolated Docker containers.
 #
 set -euo pipefail
 
@@ -22,6 +22,7 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
+CYAN='\033[0;36m'
 BOLD='\033[1m'
 DIM='\033[2m'
 RESET='\033[0m'
@@ -30,6 +31,26 @@ log()   { echo -e "${GREEN}▸${RESET} $*"; }
 warn()  { echo -e "${YELLOW}▸${RESET} $*" >&2; }
 error() { echo -e "${RED}✖${RESET} $*" >&2; }
 dim()   { echo -e "${DIM}$*${RESET}"; }
+
+# ─── Preflight ────────────────────────────────────────────────────────────────
+
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        error "Docker is not installed."
+        echo ""
+        echo -e "  Install it from: ${BOLD}https://docs.docker.com/get-docker/${RESET}"
+        echo ""
+        exit 1
+    fi
+
+    if ! docker info &>/dev/null 2>&1; then
+        error "Docker is not running."
+        echo ""
+        echo -e "  Start Docker Desktop or run: ${BOLD}sudo systemctl start docker${RESET}"
+        echo ""
+        exit 1
+    fi
+}
 
 # ─── Repo Picker ──────────────────────────────────────────────────────────────
 
@@ -78,9 +99,7 @@ pick_repo() {
     echo "" >&2
 
     local i=1
-    local display_paths=()
     for repo in "${repos[@]}"; do
-        display_paths+=("${repo/#$HOME/~}")
         printf "  ${BOLD}%3d${RESET}  %s\n" "$i" "${repo/#$HOME/~}" >&2
         ((i++))
     done
@@ -98,39 +117,216 @@ pick_repo() {
     done
 }
 
-# ─── Help ──────────────────────────────────────────────────────────────────────
+# ─── MCP Server Picker ───────────────────────────────────────────────────────
+
+find_mcp_configs() {
+    local configs=()
+    # Global MCP config
+    if [[ -f "${HOME}/.claude/.mcp.json" ]]; then
+        configs+=("${HOME}/.claude/.mcp.json")
+    fi
+    # Project-level MCP configs
+    if [[ -n "${1:-}" && -f "${1}/.mcp.json" ]]; then
+        configs+=("${1}/.mcp.json")
+    fi
+    printf '%s\n' "${configs[@]}"
+}
+
+list_mcp_servers() {
+    local repo_path="${1:-}"
+    local configs
+    configs=$(find_mcp_configs "$repo_path")
+
+    [[ -z "$configs" ]] && return
+
+    while IFS= read -r config; do
+        if command -v python3 &>/dev/null; then
+            python3 -c "
+import json, sys
+with open('$config') as f:
+    data = json.load(f)
+for name in sorted(data.get('mcpServers', {})):
+    server = data['mcpServers'][name]
+    cmd = server.get('command', '?')
+    args = ' '.join(server.get('args', [])[:2])
+    print(f'{name}\t{cmd} {args}\t$config')
+" 2>/dev/null
+        fi
+    done <<< "$configs"
+}
+
+pick_mcp_servers() {
+    local repo_path="${1:-}"
+    local servers=()
+    local names=()
+    local details=()
+
+    while IFS=$'\t' read -r name detail source; do
+        [[ -z "$name" ]] && continue
+        names+=("$name")
+        details+=("$detail")
+        servers+=("$name")
+    done < <(list_mcp_servers "$repo_path")
+
+    if [[ ${#servers[@]} -eq 0 ]]; then
+        return
+    fi
+
+    echo "" >&2
+    echo -e "${BOLD}MCP servers found in your config:${RESET}" >&2
+    dim "Select which ones to make available in the sandbox." >&2
+    echo "" >&2
+
+    local i=1
+    for idx in "${!names[@]}"; do
+        printf "  ${BOLD}%3d${RESET}  ${CYAN}%-20s${RESET}  ${DIM}%s${RESET}\n" "$i" "${names[$idx]}" "${details[$idx]}" >&2
+        ((i++))
+    done
+    echo "" >&2
+    echo -e "  ${DIM}Enter numbers separated by spaces, 'all', or 'none'${RESET}" >&2
+
+    local choice
+    echo -ne "  ${GREEN}▸${RESET} MCP servers: " >&2
+    read -r choice
+
+    if [[ "$choice" == "none" || -z "$choice" ]]; then
+        return
+    fi
+
+    if [[ "$choice" == "all" ]]; then
+        printf '%s\n' "${names[@]}"
+        return
+    fi
+
+    for num in $choice; do
+        if [[ "$num" =~ ^[0-9]+$ ]] && (( num >= 1 && num <= ${#names[@]} )); then
+            echo "${names[$((num-1))]}"
+        fi
+    done
+}
+
+build_mcp_config() {
+    local repo_path="${1:-}"
+    shift
+    local selected=("$@")
+
+    [[ ${#selected[@]} -eq 0 ]] && return
+
+    local configs
+    configs=$(find_mcp_configs "$repo_path")
+
+    python3 -c "
+import json, sys
+
+selected = set(sys.argv[1:])
+result = {'mcpServers': {}}
+
+configs = '''$configs'''.strip().split('\n')
+for config_path in configs:
+    if not config_path:
+        continue
+    with open(config_path) as f:
+        data = json.load(f)
+    for name, server in data.get('mcpServers', {}).items():
+        if name in selected:
+            result['mcpServers'][name] = server
+
+print(json.dumps(result, indent=2))
+" "${selected[@]}" 2>/dev/null
+}
+
+# ─── Agent Picker ─────────────────────────────────────────────────────────────
+
+find_agents() {
+    local agent_dir="${HOME}/.claude/agents"
+    [[ -d "$agent_dir" ]] || return
+
+    find "$agent_dir" -name "*.md" -type f 2>/dev/null | sort
+}
+
+pick_agents() {
+    local agents=()
+    local names=()
+
+    while IFS= read -r path; do
+        [[ -z "$path" ]] && continue
+        local name
+        name="$(basename "$path" .md)"
+        agents+=("$path")
+        names+=("$name")
+    done < <(find_agents)
+
+    if [[ ${#agents[@]} -eq 0 ]]; then
+        return
+    fi
+
+    echo "" >&2
+    echo -e "${BOLD}Custom agents found:${RESET}" >&2
+    dim "Select which ones to include in the sandbox." >&2
+    echo "" >&2
+
+    local i=1
+    for name in "${names[@]}"; do
+        printf "  ${BOLD}%3d${RESET}  %s\n" "$i" "$name" >&2
+        ((i++))
+    done
+    echo "" >&2
+    echo -e "  ${DIM}Enter numbers separated by spaces, 'all', or 'none'${RESET}" >&2
+
+    local choice
+    echo -ne "  ${GREEN}▸${RESET} Agents: " >&2
+    read -r choice
+
+    if [[ "$choice" == "none" || -z "$choice" ]]; then
+        return
+    fi
+
+    if [[ "$choice" == "all" ]]; then
+        printf '%s\n' "${agents[@]}"
+        return
+    fi
+
+    for num in $choice; do
+        if [[ "$num" =~ ^[0-9]+$ ]] && (( num >= 1 && num <= ${#agents[@]} )); then
+            echo "${agents[$((num-1))]}"
+        fi
+    done
+}
+
+# ─── Help ─────────────────────────────────────────────────────────────────────
 
 usage() {
     cat <<EOF
 ${BOLD}claude-sandbox${RESET} v${VERSION}
-Run Claude Code in isolated Docker containers.
+Run Claude Code off-leash in isolated Docker containers.
 
 ${BOLD}USAGE${RESET}
     claude-sandbox <command> [options]
 
 ${BOLD}COMMANDS${RESET}
-    ${BOLD}run${RESET} <path> [opts] [-- claude args]    Launch Claude on a repo
+    ${BOLD}run${RESET} [path] [opts] [-- claude args]    Launch Claude on a repo (interactive if no path)
+    ${BOLD}login${RESET}                                  Authenticate with Claude (no API key needed)
     ${BOLD}build${RESET} [--no-cache] [version]           Build/rebuild the Docker image
     ${BOLD}list${RESET}                                   List running containers
     ${BOLD}stop${RESET} <name|all>                        Stop a container (or all)
-    ${BOLD}shell${RESET} <path> [opts]                    Open a bash shell in a container (no Claude)
+    ${BOLD}shell${RESET} [path]                           Open a bash shell in a container (no Claude)
     ${BOLD}version${RESET}                                Print version
     ${BOLD}help${RESET}                                   Show this help
 
 ${BOLD}EXAMPLES${RESET}
+    claude-sandbox                                      Interactive — pick repo, MCP servers, agents
     claude-sandbox run ~/my-project
-    claude-sandbox run ~/my-project -- -p "fix the bug in auth.ts"
-    claude-sandbox run ~/my-project --memory 8g --cpus 4
-    claude-sandbox run ~/my-project --network none
+    claude-sandbox run ~/my-project -- -p "fix the bug"
+    claude-sandbox run --no-mcp --no-agents ~/my-project
     claude-sandbox shell ~/my-project
-    claude-sandbox build
     claude-sandbox build --no-cache 1.0.2
     claude-sandbox stop all
 
 ${BOLD}ENVIRONMENT${RESET}
-    ANTHROPIC_API_KEY          API key (required unless using Bedrock/Vertex)
-    CLAUDE_CODE_USE_BEDROCK    Set to 1 for AWS Bedrock
-    CLAUDE_CODE_USE_VERTEX     Set to 1 for Google Vertex
+    ANTHROPIC_API_KEY              API key (or use 'claude-sandbox login')
+    CLAUDE_CODE_USE_BEDROCK        Set to 1 for AWS Bedrock
+    CLAUDE_CODE_USE_VERTEX         Set to 1 for Google Vertex
+    CLAUDE_SANDBOX_REPO_DIRS       Colon-separated repo search paths
 
 Run ${BOLD}claude-sandbox help <command>${RESET} for command-specific help.
 EOF
@@ -141,7 +337,9 @@ usage_run() {
 ${BOLD}claude-sandbox run${RESET} — Launch Claude on a repo
 
 ${BOLD}USAGE${RESET}
-    claude-sandbox run [options] <repo-path> [-- claude-args...]
+    claude-sandbox run [options] [repo-path] [-- claude-args...]
+
+    If no repo path is given, an interactive picker is shown.
 
 ${BOLD}OPTIONS${RESET}
     -m, --memory <limit>    Memory limit (default: ${DEFAULT_MEMORY})
@@ -149,20 +347,26 @@ ${BOLD}OPTIONS${RESET}
     -n, --network <mode>    Network mode: host, none, bridge (default: ${DEFAULT_NETWORK})
     -i, --image <name>      Docker image (default: ${IMAGE})
         --no-config         Don't mount ~/.claude
+        --no-mcp            Skip MCP server selection
+        --no-agents         Skip agent selection
         --build             Rebuild image before launching
         --name <name>       Custom container name
 
 ${BOLD}EXAMPLES${RESET}
+    claude-sandbox run
     claude-sandbox run ~/repos/my-app
     claude-sandbox run -m 8g -c 4 ~/repos/my-app
     claude-sandbox run --network none ~/repos/untrusted-code
+    claude-sandbox run --no-mcp --no-agents ~/repos/my-app
     claude-sandbox run ~/repos/my-app -- -p "add unit tests for auth"
 EOF
 }
 
-# ─── Build ─────────────────────────────────────────────────────────────────────
+# ─── Build ────────────────────────────────────────────────────────────────────
 
 cmd_build() {
+    check_docker
+
     local no_cache=""
     local version="latest"
 
@@ -179,9 +383,11 @@ cmd_build() {
     log "Image ready: ${BOLD}${IMAGE}${RESET}"
 }
 
-# ─── Run ───────────────────────────────────────────────────────────────────────
+# ─── Run ──────────────────────────────────────────────────────────────────────
 
 cmd_run() {
+    check_docker
+
     local memory="$DEFAULT_MEMORY"
     local cpus="$DEFAULT_CPUS"
     local network="$DEFAULT_NETWORK"
@@ -190,6 +396,8 @@ cmd_run() {
     local build=false
     local custom_name=""
     local repo_path=""
+    local skip_mcp=false
+    local skip_agents=false
     local claude_args=()
     local docker_args=()
 
@@ -201,6 +409,8 @@ cmd_run() {
             -n|--network) network="$2"; shift 2 ;;
             -i|--image) image="$2"; shift 2 ;;
             --no-config) mount_config=false; shift ;;
+            --no-mcp) skip_mcp=true; shift ;;
+            --no-agents) skip_agents=true; shift ;;
             --build) build=true; shift ;;
             --name) custom_name="$2"; shift 2 ;;
             --) shift; claude_args=("$@"); break ;;
@@ -238,6 +448,47 @@ cmd_run() {
         docker_args+=(-v "${HOME}/.claude:/home/claude/.claude:ro")
     fi
 
+    # MCP server selection
+    local selected_mcp=()
+    if [[ "$skip_mcp" == false ]]; then
+        while IFS= read -r server; do
+            [[ -z "$server" ]] && continue
+            selected_mcp+=("$server")
+        done < <(pick_mcp_servers "$repo_path")
+    fi
+
+    if [[ ${#selected_mcp[@]} -gt 0 ]]; then
+        local mcp_json
+        mcp_json=$(build_mcp_config "$repo_path" "${selected_mcp[@]}")
+        if [[ -n "$mcp_json" ]]; then
+            local tmp_mcp
+            tmp_mcp=$(mktemp)
+            echo "$mcp_json" > "$tmp_mcp"
+            docker_args+=(-v "${tmp_mcp}:/home/claude/.mcp.json:ro")
+            trap "rm -f '$tmp_mcp'" EXIT
+            echo ""
+            log "MCP servers: ${BOLD}${selected_mcp[*]}${RESET}"
+        fi
+    fi
+
+    # Agent selection
+    local selected_agents=()
+    if [[ "$skip_agents" == false ]]; then
+        while IFS= read -r agent; do
+            [[ -z "$agent" ]] && continue
+            selected_agents+=("$agent")
+        done < <(pick_agents)
+    fi
+
+    if [[ ${#selected_agents[@]} -gt 0 ]]; then
+        docker_args+=(-v "${HOME}/.claude/agents:/home/claude/.claude/agents:ro")
+        local agent_names=()
+        for a in "${selected_agents[@]}"; do
+            agent_names+=("$(basename "$a" .md)")
+        done
+        log "Agents:      ${BOLD}${agent_names[*]}${RESET}"
+    fi
+
     # Pass through env vars
     local env_vars=(
         ANTHROPIC_API_KEY
@@ -273,9 +524,11 @@ cmd_run() {
         "${claude_args[@]}"
 }
 
-# ─── Shell ─────────────────────────────────────────────────────────────────────
+# ─── Shell ────────────────────────────────────────────────────────────────────
 
 cmd_shell() {
+    check_docker
+
     local memory="$DEFAULT_MEMORY"
     local cpus="$DEFAULT_CPUS"
     local network="$DEFAULT_NETWORK"
@@ -327,9 +580,36 @@ cmd_shell() {
         "$IMAGE"
 }
 
-# ─── List ──────────────────────────────────────────────────────────────────────
+# ─── Login ────────────────────────────────────────────────────────────────────
+
+cmd_login() {
+    check_docker
+
+    if ! docker image inspect "$IMAGE" &>/dev/null; then
+        cmd_build
+    fi
+
+    mkdir -p "${HOME}/.claude"
+
+    log "Launching Claude login..."
+    dim "This will open a browser to authenticate. Your session is saved to ~/.claude."
+    echo ""
+
+    docker run -it --rm \
+        --name "claude-sandbox-login" \
+        --hostname "claude-sandbox" \
+        --entrypoint claude \
+        -v "${HOME}/.claude:/home/claude/.claude" \
+        --network=host \
+        "$IMAGE" \
+        login
+}
+
+# ─── List ─────────────────────────────────────────────────────────────────────
 
 cmd_list() {
+    check_docker
+
     local containers
     containers=$(docker ps --filter "ancestor=${IMAGE}" --format "table {{.Names}}\t{{.Status}}\t{{.RunningFor}}" 2>/dev/null)
 
@@ -342,9 +622,11 @@ cmd_list() {
     echo "$containers"
 }
 
-# ─── Stop ──────────────────────────────────────────────────────────────────────
+# ─── Stop ─────────────────────────────────────────────────────────────────────
 
 cmd_stop() {
+    check_docker
+
     local target="${1:-}"
 
     if [[ -z "$target" ]]; then
@@ -368,7 +650,7 @@ cmd_stop() {
     fi
 }
 
-# ─── Main ──────────────────────────────────────────────────────────────────────
+# ─── Main ─────────────────────────────────────────────────────────────────────
 
 main() {
     if [[ $# -eq 0 ]]; then
@@ -380,6 +662,7 @@ main() {
 
     case "$cmd" in
         run)     cmd_run "$@" ;;
+        login)   cmd_login "$@" ;;
         build)   cmd_build "$@" ;;
         list|ls) cmd_list "$@" ;;
         stop)    cmd_stop "$@" ;;

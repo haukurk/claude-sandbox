@@ -27,7 +27,8 @@ cd ~/.claude-sandbox
 ## Quick start
 
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...
+# Authenticate (one time — opens browser, no API key needed)
+claude-sandbox login
 
 # Interactive — pick a repo from a list
 claude-sandbox
@@ -43,12 +44,13 @@ If you have [fzf](https://github.com/junegunn/fzf) installed, you get a fuzzy se
 ## Commands
 
 ```
-claude-sandbox                                       Pick a repo and go (interactive)
-claude-sandbox run <path> [opts] [-- claude args]    Launch Claude on a specific repo
+claude-sandbox                                       Pick a repo, MCP servers, agents — go
+claude-sandbox run [path] [opts] [-- claude args]    Launch Claude on a repo
+claude-sandbox login                                 Authenticate (opens browser)
 claude-sandbox build [--no-cache] [version]           Build/rebuild the Docker image
 claude-sandbox list                                   See what's running
 claude-sandbox stop <name|all>                        Pull the plug
-claude-sandbox shell <path>                           Poke around the container yourself
+claude-sandbox shell [path]                           Poke around the container yourself
 claude-sandbox help                                   You're reading it
 ```
 
@@ -86,6 +88,8 @@ claude-sandbox stop all
 | `-n, --network` | `host` | `host`, `none`, or `bridge` |
 | `-i, --image` | `claude-sandbox:latest` | Custom image |
 | `--no-config` | | Don't mount `~/.claude` |
+| `--no-mcp` | | Skip MCP server selection |
+| `--no-agents` | | Skip agent selection |
 | `--build` | | Rebuild image first |
 | `--name` | | Custom container name |
 
@@ -100,6 +104,27 @@ claude-sandbox stop all
 | Other repos | Nope |
 | Network | Up to you (`host` / `none` / `bridge`) |
 | RAM / CPU | Capped |
+
+## MCP servers & agents
+
+When you run `claude-sandbox` interactively, it finds MCP servers from your `~/.claude/.mcp.json` (and the repo's `.mcp.json` if present) and custom agents from `~/.claude/agents/`. You pick which ones to include — only those get mounted into the sandbox.
+
+```
+MCP servers found in your config:
+    1  playwright            npx @playwright/mcp@latest
+    2  pentest-mcp           docker run --rm -i pentest-mcp:latest
+
+  Enter numbers separated by spaces, 'all', or 'none'
+  ▸ MCP servers: 1
+
+Custom agents found:
+    1  qa-staging
+
+  Enter numbers separated by spaces, 'all', or 'none'
+  ▸ Agents: all
+```
+
+Skip the prompts with `--no-mcp` and `--no-agents`.
 
 ## Repo discovery
 
@@ -118,17 +143,16 @@ export CLAUDE_SANDBOX_REPO_DIRS="$HOME/my-stuff:$HOME/work/clients"
 ## Authentication
 
 ```bash
-# Option 1: env var (recommended)
-export ANTHROPIC_API_KEY=sk-ant-...
+# Option 1: browser login (no API key needed)
+claude-sandbox login
 
-# Option 2: .env file
-cp .env.example .env  # fill in your key
-source .env
+# Option 2: API key
+export ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-AWS Bedrock and Google Vertex are also supported — see `.env.example`.
+`claude-sandbox login` runs `claude login` inside the container and saves your session to `~/.claude`. After that, every container picks it up automatically — no key needed.
 
-If you've already run `claude` on your host, the `~/.claude` config is mounted read-only so your session just works.
+AWS Bedrock and Google Vertex are also supported via env vars — see `.env.example`.
 
 ## What's in the box
 
