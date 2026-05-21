@@ -601,8 +601,13 @@ cmd_run() {
     fi
 
     # Mount claude config
-    if [[ "$mount_config" == true && -d "${HOME}/.claude" ]]; then
-        docker_args+=(-v "${HOME}/.claude:/home/claude/.claude:ro")
+    if [[ "$mount_config" == true ]]; then
+        if [[ -d "${HOME}/.claude" ]]; then
+            docker_args+=(-v "${HOME}/.claude:/home/claude/.claude:ro")
+        fi
+        if [[ -f "${HOME}/.claude.json" ]]; then
+            docker_args+=(-v "${HOME}/.claude.json:/home/claude/.claude.json:ro")
+        fi
     fi
 
     # MCP server selection
@@ -721,6 +726,9 @@ cmd_shell() {
 
     if [[ -d "${HOME}/.claude" ]]; then
         docker_args+=(-v "${HOME}/.claude:/home/claude/.claude:ro")
+    fi
+    if [[ -f "${HOME}/.claude.json" ]]; then
+        docker_args+=(-v "${HOME}/.claude.json:/home/claude/.claude.json:ro")
     fi
 
     log "Opening shell in ${BOLD}${repo_path}${RESET}"
